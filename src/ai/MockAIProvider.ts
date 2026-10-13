@@ -101,6 +101,17 @@ function getActiveTask(
   }
 }
 
+/**
+ * Valida el formato básico de un identificador.
+ * No sustituye la validación real que debe realizar
+ * cada herramienta cuando se conecten datos reales.
+ */
+function isSimpleIdentifier(
+  value: string,
+): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$/.test(value)
+}
+
 export class MockAIProvider
   implements NexoraAIProvider
 {
@@ -146,8 +157,6 @@ export class MockAIProvider
           (issue.missingInputs?.length ?? 0) > 0,
       )
 
-    // Si el plan todavía tiene datos obligatorios
-    // pendientes, no se solicita ejecutar la herramienta.
     if (blockedIssue) {
       const missingInputs =
         blockedIssue.missingInputs ?? []
@@ -164,15 +173,19 @@ export class MockAIProvider
       }
     }
 
-    // La respuesta de una herramienta ejecutada
-    // se comunica antes de generar una nueva acción.
     const interpretedResults =
       request.interpretedExecutionResults ?? []
 
     if (
       interpretedResults.length > 0 &&
-      normalizedContent === 'ejecuta test.echo'
-    ) {
+    (
+    normalizedContent === 'ejecuta test.echo' ||
+    request.context?.data &&
+    isRecord(request.context.data) &&
+    isRecord(request.context.data.activeTask) &&
+    request.context.data.activeTask.status === 'waiting_for_input'
+    )
+  ) {
       const interpreted =
         interpretedResults[0]
 
@@ -203,10 +216,6 @@ export class MockAIProvider
       }
     }
 
-    // CONTINUIDAD DE TAREAS:
-    // Este proveedor simulado puede asociar una respuesta
-    // con una tarea que espera un único dato obligatorio.
-    // No pretende sustituir la comprensión de un modelo real.
     const activeTask = getActiveTask(
       request.context?.data,
     )
@@ -216,7 +225,8 @@ export class MockAIProvider
       activeTask?.status === 'waiting_for_input' &&
       activeTask.missingInformation.length === 1 &&
       content.length > 0 &&
-      normalizedContent !== 'ejecuta test.echo'
+      normalizedContent !== 'ejecuta test.echo' &&
+      isSimpleIdentifier(content)
     ) {
       const missingKey =
         activeTask.missingInformation[0].key
@@ -268,9 +278,6 @@ export class MockAIProvider
       }
     }
 
-    // Solicitud de prueba inicial.
-    // Se envían los argumentos vacíos para que el planificador
-    // detecte clientId como dato obligatorio faltante.
     if (
       request.responseFormat === 'structured' &&
       normalizedContent === 'ejecuta test.echo'
@@ -302,17 +309,19 @@ export class MockAIProvider
       }
     }
 
-    // Respuesta predeterminada para consultas que el
-    // proveedor simulado no sabe interpretar.
     return {
-      content: lastMessage
-        ? `Solicitud recibida: "${lastMessage.content}"`
-        : 'No se recibió ningún mensaje.',
+      content: activeTask?.status === 'waiting_for_input'
+        ? 'La tarea sigue pendiente. Para continuar, proporciona el identificador solicitado en un formato válido.'
+        : lastMessage
+          ? `Solicitud recibida: "${lastMessage.content}"`
+          : 'No se recibió ningún mensaje.',
       intent: {
-        type: 'question',
+        type: activeTask?.status === 'waiting_for_input'
+          ? 'clarification'
+          : 'question',
         confidence: 0.5,
         description:
-          'El proveedor simulado recibió una consulta sin interpretación especializada.',
+          'El proveedor simulado no pudo confirmar una continuación válida.',
         goal: lastMessage?.content,
         entities: [],
         ambiguous: true,

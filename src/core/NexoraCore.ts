@@ -154,7 +154,6 @@ export class NexoraCore {
       input.context ??
       this.contextManager.get()
 
-    // Recupera la tarea activa sin modificarla.
     const activeTaskId =
       context.taskId ??
       this.contextManager.get().taskId
@@ -168,7 +167,6 @@ export class NexoraCore {
         ? activeTask
         : undefined
 
-    // Proporciona al motor los datos de la tarea pendiente.
     const engineContext: NexoraContext =
       continuingTask
         ? {
@@ -226,11 +224,6 @@ export class NexoraCore {
     const entities =
       result.interpretation.intent.entities ?? []
 
-    // Solo reconoce una continuación si:
-    // 1. Existe una tarea esperando información.
-    // 2. La herramienta pertenece a su plan bloqueado.
-    // 3. Se ha proporcionado un argumento que faltaba.
-    // 4. La interpretación contiene ese mismo dato.
     const continuationCall =
       continuingTask
         ? toolCalls.find((call) =>
@@ -280,11 +273,27 @@ export class NexoraCore {
       continuingTask !== undefined &&
       continuationCall !== undefined
 
+    if (continuingTask && !isContinuation) {
+      const assistantMessage: NexoraMessage = {
+        id: crypto.randomUUID(),
+        role: 'assistant',
+        content:
+          'La tarea original sigue pendiente. Proporciona el identificador solicitado para continuar; no he ejecutado ninguna acción nueva.',
+        createdAt: Date.now(),
+      }
+
+      this.conversationManager.addMessage(assistantMessage)
+
+      return {
+        message: assistantMessage,
+        intent: result.interpretation.intent,
+        requiresConfirmation: false,
+      }
+    }
+
     const generatedTask =
       this.taskFactory.create(result)
 
-    // Solo guardamos como información recibida los datos
-    // que coinciden con los argumentos reconocidos.
     const receivedInformation =
       isContinuation
         ? entities
@@ -329,13 +338,60 @@ export class NexoraCore {
         ]
       : generatedTask.availableInformation
 
-    // La continuación conserva el ID y el objetivo originales.
-    // Una solicitud distinta recibe una tarea independiente.
     const task: NexoraTask = isContinuation
       ? {
           ...generatedTask,
           id: continuingTask.id,
           objective: continuingTask.objective,
+          status:
+            generatedTask.missingInformation.length > 0
+              ? 'waiting_for_input'
+              : 'pending',
+          plan: continuingTask.plan?.map((originalStep) => {
+            const matchingStep =
+              result.plan.steps.find(
+                (newStep) =>
+                  newStep.toolCall?.toolId ===
+                  originalStep.toolCall?.toolId,
+              )
+
+            if (
+              originalStep.status !== 'blocked' ||
+              !originalStep.toolCall ||
+              !matchingStep?.toolCall
+            ) {
+              return {
+                ...originalStep,
+                dependsOn: originalStep.dependsOn
+                  ? [...originalStep.dependsOn]
+                  : undefined,
+                missingInputs: originalStep.missingInputs
+                  ? [...originalStep.missingInputs]
+                  : undefined,
+                toolCall: originalStep.toolCall
+                  ? {
+                      ...originalStep.toolCall,
+                      arguments: {
+                        ...originalStep.toolCall.arguments,
+                      },
+                    }
+                  : undefined,
+              }
+            }
+
+            return {
+              ...originalStep,
+              status: 'ready',
+              missingInputs: [],
+              toolCall: {
+                ...originalStep.toolCall,
+                arguments: {
+                  ...originalStep.toolCall.arguments,
+                  ...matchingStep.toolCall.arguments,
+                },
+              },
+            }
+          }),
           availableInformation: mergedInformation,
           missingInformation:
             generatedTask.missingInformation.filter(
@@ -354,12 +410,29 @@ export class NexoraCore {
       taskId: task.id,
     })
 
+    const planToExecute: NexoraPlan =
+      isContinuation
+        ? {
+            ...result.plan,
+            objective: continuingTask.objective,
+            steps: task.plan ?? [],
+          }
+        : result.plan
+
     const planIssues =
-      this.buildPlanIssues(result.plan.steps)
+      this.buildPlanIssues(planToExecute.steps)
+
+    const planToolCalls =
+      planToExecute.steps
+        .map((step) => step.toolCall)
+        .filter(
+          (toolCall): toolCall is NexoraToolCall =>
+            toolCall !== undefined,
+        )
 
     const requiresConfirmation =
-      result.plan.requiresConfirmation ||
-      toolCalls.some((toolCall) => {
+      planToExecute.requiresConfirmation ||
+      planToolCalls.some((toolCall) => {
         const permission =
           this.permissionManager.getPermission(
             toolCall.toolId,
@@ -375,8 +448,6 @@ export class NexoraCore {
         )
       })
 
-    // Si faltan datos, se informa al usuario y se conserva
-    // la tarea pendiente para una respuesta posterior.
     if (planIssues.length > 0) {
       const response =
         await this.engine.generateResponse({
@@ -402,19 +473,17 @@ export class NexoraCore {
         message: assistantMessage,
         intent: result.interpretation.intent,
         toolCalls:
-          toolCalls.length > 0
-            ? toolCalls
+          planToolCalls.length > 0
+            ? planToolCalls
             : undefined,
         requiresConfirmation: false,
       }
     }
 
-    // Las acciones que necesitan autorización siguen
-    // detenidas hasta que el usuario las confirme.
     if (requiresConfirmation) {
       const pendingPlan: NexoraPendingPlan = {
         id: crypto.randomUUID(),
-        plan: result.plan,
+        plan: planToExecute,
         createdAt: Date.now(),
         userMessage,
         context: engineContext,
@@ -437,8 +506,8 @@ export class NexoraCore {
         message: assistantMessage,
         intent: result.interpretation.intent,
         toolCalls:
-          toolCalls.length > 0
-            ? toolCalls
+          planToolCalls.length > 0
+            ? planToolCalls
             : undefined,
         requiresConfirmation: true,
       }
@@ -450,22 +519,33 @@ export class NexoraCore {
     )
 
     const planExecution =
-      await this.planExecutor.execute(result.plan)
+      await this.planExecutor.execute(planToExecute)
 
     const executionResults =
       planExecution.executionResults
 
     const hasFailedSteps =
       planExecution.plan.steps.some(
-        (step) => step.status === 'failed',
+        (step) =>
+          step.status === 'failed' ||
+          step.status === 'blocked',
       )
+
+    const currentTask = this.taskManager.get(task.id)
+
+    if (currentTask) {
+      this.taskManager.create({
+        ...currentTask,
+        plan: planExecution.plan.steps,
+      })
+    }
 
     this.taskManager.updateStatus(
       task.id,
       hasFailedSteps ? 'failed' : 'completed',
     )
 
-    const interpretedExecutionResults =
+    const interpretedExecutionResults: NexoraInterpretedExecutionResult[] =
       executionResults.map(
         (executionResult) =>
           this.resultInterpreter.interpret(
@@ -496,8 +576,8 @@ export class NexoraCore {
       message: assistantMessage,
       intent: result.interpretation.intent,
       toolCalls:
-        toolCalls.length > 0
-          ? toolCalls
+        planToolCalls.length > 0
+          ? planToolCalls
           : undefined,
       executionResults:
         executionResults.length > 0
@@ -590,17 +670,28 @@ export class NexoraCore {
 
     const hasFailedSteps =
       result.plan.steps.some(
-        (step) => step.status === 'failed',
+        (step) =>
+          step.status === 'failed' ||
+          step.status === 'blocked',
       )
 
     if (taskId) {
+      const currentTask = this.taskManager.get(taskId)
+
+      if (currentTask) {
+        this.taskManager.create({
+          ...currentTask,
+          plan: result.plan.steps,
+        })
+      }
+
       this.taskManager.updateStatus(
         taskId,
         hasFailedSteps ? 'failed' : 'completed',
       )
     }
 
-    const interpretedExecutionResults =
+    const interpretedExecutionResults: NexoraInterpretedExecutionResult[] =
       executionResults.map(
         (executionResult) =>
           this.resultInterpreter.interpret(
